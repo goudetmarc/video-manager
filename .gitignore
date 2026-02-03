@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+settings.json
+inventory.json
+raw_inventory.json
+# Affiches TMDB téléchargées (évite de versionner des centaines d'images)
+static/posters/

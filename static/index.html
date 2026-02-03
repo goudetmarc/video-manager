@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Video Manager – Inventaire pro</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0a0a0c;
+      --surface: #111113;
+      --surface-2: #18181b;
+      --border: #27272a;
+      --text: #fafafa;
+      --text-muted: #71717a;
+      --accent: #6366f1;
+      --radius: 8px;
+      --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      /* Codec badges */
+      --codec-hevc: #8b5cf6;
+      --codec-h264: #3b82f6;
+      --codec-vp9: #10b981;
+      --codec-av1: #f59e0b;
+      --codec-mpeg: #6b7280;
+      /* Résolution */
+      --res-720: #6b7280;
+      --res-1080: #2563eb;
+      --res-2k: #0d9488;
+      --res-4k: #7c3aed;
+      --res-8k: #d97706;
+      /* HDR */
+      --hdr: #22c55e;
+      --hdr10plus: #eab308;
+      --dv: #a855f7;
+      --sdr: #52525b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: var(--font); background: var(--bg); color: var(--text); min-height: 100vh; line-height: 1.5; font-size: 13px; }
+    .app { display: flex; min-height: 100vh; }
+    .sidebar {
+      width: 220px; min-width: 220px;
+      background: var(--surface); border-right: 1px solid var(--border);
+      padding: 1.25rem 0;
+    }
+    .logo { padding: 0 1rem 1.25rem; font-size: 1.1rem; font-weight: 700; letter-spacing: -0.02em; }
+    .logo span { color: var(--accent); }
+    .nav { display: flex; flex-direction: column; }
+    .nav a {
+      padding: 0.6rem 1rem; color: var(--text-muted); text-decoration: none; font-weight: 500; font-size: 0.9rem;
+    }
+    .nav a:hover, .nav a.active { background: var(--surface-2); color: var(--text); }
+    .main { flex: 1; overflow: auto; padding: 1.5rem 2rem; }
+    .page { display: none; }
+    .page.active { display: block; }
+    .page h1 { font-size: 1.35rem; font-weight: 600; margin-bottom: 0.35rem; letter-spacing: -0.02em; }
+    .page .sub { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.25rem; }
+    .card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 1.25rem; margin-bottom: 1.25rem;
+    }
+    .card h2 { font-size: 0.75rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 0.75rem; }
+    .form-group { margin-bottom: 0.75rem; }
+    .form-group label { display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.35rem; }
+    .form-group input { width: 100%; max-width: 420px; padding: 0.55rem 0.75rem; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-family: inherit; font-size: 0.9rem; }
+    .btn { padding: 0.55rem 1.1rem; border: none; border-radius: 6px; font-weight: 600; font-size: 0.875rem; cursor: pointer; font-family: inherit; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { opacity: 0.92; }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .stats { display: flex; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    .stat { background: var(--surface-2); padding: 0.5rem 1rem; border-radius: 6px; border: 1px solid var(--border); font-size: 0.85rem; }
+    .stat strong { color: var(--accent); font-weight: 600; }
+    .filter-bar { margin-bottom: 0.75rem; }
+    .filter-bar input { padding: 0.5rem 0.75rem; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; color: var(--text); width: 100%; max-width: 340px; font-family: inherit; font-size: 0.9rem; }
+    .inventory-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+    .inventory-table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
+    .inventory-table th, .inventory-table td { padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    .inventory-table th { background: var(--surface-2); color: var(--text-muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; position: sticky; top: 0; white-space: nowrap; cursor: pointer; user-select: none; padding-right: 1rem; }
+    .inventory-table th:hover { color: var(--text); }
+    .inventory-table th .sort-icon { opacity: 0.5; margin-left: 0.25rem; }
+    .inventory-table th.sorted .sort-icon { opacity: 1; color: var(--accent); }
+    .cell-doublons { max-width: 280px; font-size: 0.8rem; }
+    .cell-doublons .doublon-item { display: flex; align-items: center; gap: 0.5rem; padding: 0.2rem 0; border-bottom: 1px solid var(--border); }
+    .cell-doublons .doublon-item:last-child { border-bottom: none; }
+    .cell-doublons .doublon-name { overflow: hidden; text-overflow: ellipsis; color: var(--text-muted); }
+    .cell-doublons .doublon-size { font-variant-numeric: tabular-nums; color: var(--accent); flex-shrink: 0; }
+    .inventory-table tr:hover { background: rgba(255,255,255,0.02); }
+    .inventory-table .col-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+    .inventory-table .col-path { max-width: 220px; overflow: hidden; text-overflow: ellipsis; font-size: 0.8rem; color: var(--text-muted); }
+    .inventory-table .col-film { max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+    .inventory-table .col-num { text-align: right; font-variant-numeric: tabular-nums; }
+    .inventory-table .cell-badges { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; }
+    .badge { display: inline-flex; align-items: center; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.02em; white-space: nowrap; }
+    .badge-codec-hevc { background: rgba(139,92,246,0.25); color: #a78bfa; }
+    .badge-codec-h264 { background: rgba(59,130,246,0.25); color: #60a5fa; }
+    .badge-codec-vp9 { background: rgba(16,185,129,0.25); color: #34d399; }
+    .badge-codec-av1 { background: rgba(245,158,11,0.25); color: #fbbf24; }
+    .badge-codec-mpeg { background: rgba(107,114,128,0.25); color: #9ca3af; }
+    .badge-res-720p { background: rgba(107,114,128,0.25); color: #9ca3af; }
+    .badge-res-1080p { background: rgba(37,99,235,0.25); color: #60a5fa; }
+    .badge-res-2k { background: rgba(13,148,136,0.25); color: #2dd4bf; }
+    .badge-res-4k { background: rgba(124,58,237,0.25); color: #a78bfa; }
+    .badge-res-8k { background: rgba(217,119,6,0.25); color: #fbbf24; }
+    .badge-hdr { background: rgba(34,197,94,0.25); color: #4ade80; }
+    .badge-hdr10plus { background: rgba(234,179,8,0.25); color: #facc15; }
+    .badge-dv { background: rgba(168,85,247,0.25); color: #c084fc; }
+    .badge-sdr { background: rgba(82,82,91,0.25); color: #a1a1aa; }
+    .badge-container { background: rgba(99,102,241,0.2); color: #818cf8; }
+    .cell-duration { font-variant-numeric: tabular-nums; }
+    .cell-resolution { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+    .cell-resolution .pixels { font-family: ui-monospace, monospace; font-size: 0.8rem; color: var(--text-muted); }
+    .ffmpeg-status { display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 0; font-size: 0.85rem; }
+    .status-msg { margin-top: 0.5rem; font-size: 0.85rem; }
+    .status-msg.loading { color: var(--text-muted); }
+    .status-msg.error { color: #ef4444; }
+    .empty { color: var(--text-muted); padding: 2.5rem; text-align: center; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="logo">Video <span>Manager</span></div>
+      <nav class="nav">
+        <a href="#" class="nav-link active" data-page="inventory">Inventaire</a>
+        <a href="#" class="nav-link" data-page="settings">Paramètres</a>
+      </nav>
+    </aside>
+    <main class="main">
+      <div id="page-inventory" class="page active">
+        <h1>Inventaire vidéo</h1>
+        <p class="sub">Données enregistrées après un scan. Durées en h/min/s, résolutions et codecs en format industrie.</p>
+        <div class="card">
+          <h2>Scanner le dossier (une fois)</h2>
+          <div id="ffmpeg-status" class="ffmpeg-status"></div>
+          <div class="form-group">
+            <label for="scan-path">Dossier vidéo (NAS)</label>
+            <input type="text" id="scan-path" placeholder="Ex: /Volumes/NAS/Videos" />
+          </div>
+          <button type="button" id="btn-scan" class="btn btn-primary">Scanner et enregistrer l'inventaire</button>
+          <p class="sub" style="margin-top: 0.5rem; font-size: 0.8rem;">Un nouveau scan <strong>remplace entièrement</strong> l'inventaire précédent.</p>
+          <div id="scan-status" class="status-msg"></div>
+          <div id="scan-error" class="status-msg error"></div>
+        </div>
+        <div id="inventory-meta" class="stats" style="display: none;"></div>
+        <div id="inventory-section" style="display: none;">
+          <div class="filter-bar">
+            <input type="text" id="filter" placeholder="Filtrer par nom, film, codec, résolution…" />
+          </div>
+          <div class="inventory-wrap">
+            <table class="inventory-table" id="table">
+              <thead id="table-head"></thead>
+              <tbody id="table-body"></tbody>
+            </table>
+          </div>
+        </div>
+        <div id="inventory-empty" class="empty">Aucun inventaire enregistré. Lancez un scan pour remplir le tableau.</div>
+      </div>
+      <div id="page-settings" class="page">
+        <h1>Paramètres</h1>
+        <p class="sub">Chemin du dossier vidéo et FFmpeg.</p>
+        <div class="card">
+          <h2>Dossier vidéo (NAS)</h2>
+          <div class="form-group">
+            <label for="settings-path">Chemin</label>
+            <input type="text" id="settings-path" placeholder="Ex: /Volumes/NAS/Videos" />
+          </div>
+          <button type="button" id="btn-save-settings" class="btn btn-primary">Enregistrer</button>
+        </div>
+        <div class="card">
+          <h2>FFmpeg</h2>
+          <div id="ffmpeg-settings" class="ffmpeg-status"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+  <script>
+    const $ = id => document.getElementById(id);
+    const scanPath = $('scan-path');
+    const settingsPath = $('settings-path');
+    const btnScan = $('btn-scan');
+    const btnSaveSettings = $('btn-save-settings');
+    const scanStatus = $('scan-status');
+    const scanError = $('scan-error');
+    const inventoryMeta = $('inventory-meta');
+    const inventorySection = $('inventory-section');
+    const inventoryEmpty = $('inventory-empty');
+    const filterInput = $('filter');
+    const tableHead = $('table-head');
+    const tableBody = $('table-body');
+    let lastInventoryFiles = [];
+    let scanTotalExpected = 0;
+    let sortKey = null;
+    let sortDir = 'asc';
+
+    function escapeHtml(s) {
+      if (s == null || s === undefined) return '';
+      const div = document.createElement('div');
+      div.textContent = String(s);
+      return div.innerHTML;
+    }
+
+    function formatDurationHMS(sec) {
+      if (sec == null || !Number(sec)) return '—';
+      const h = Math.floor(Number(sec) / 3600);
+      const m = Math.floor((Number(sec) % 3600) / 60);
+      const s = Math.floor(Number(sec) % 60);
+      const parts = [];
+      if (h > 0) parts.push(h + 'h');
+      if (m > 0 || h > 0) parts.push(m + 'min');
+      parts.push(s + 's');
+      return parts.join(' ');
+    }
+
+    function formatSizePro(bytes) {
+      if (bytes == null || !Number(bytes)) return '—';
+      const n = Number(bytes);
+      if (n >= 1e12) return (n / 1e12).toFixed(1).replace('.', ',') + ' To';
+      if (n >= 1e9) return (n / 1e9).toFixed(1).replace('.', ',') + ' Go';
+      if (n >= 1e6) return (n / 1e6).toFixed(0) + ' Mo';
+      if (n >= 1e3) return (n / 1e3).toFixed(0) + ' Ko';
+      return n + ' o';
+    }
+
+    function formatBitrateMbps(bps) {
+      if (bps == null || !Number(bps)) return '—';
+      const m = Number(bps) / 1e6;
+      return m >= 1 ? m.toFixed(1).replace('.', ',') + ' Mbit/s' : (m * 1000).toFixed(0) + ' kbit/s';
+    }
+
+    function getResolutionTier(height) {
+      const h = Number(height) || 0;
+      if (h >= 4320) return { tier: '8K', cls: 'badge-res-8k' };
+      if (h >= 2160) return { tier: '4K', cls: 'badge-res-4k' };
+      if (h >= 1440) return { tier: '2K', cls: 'badge-res-2k' };
+      if (h >= 1080) return { tier: '1080p', cls: 'badge-res-1080p' };
+      if (h >= 720) return { tier: '720p', cls: 'badge-res-720p' };
+      return null;
+    }
+
+    function getCodecBadgeClass(codec) {
+      const c = (codec || '').toUpperCase();
+      if (c.includes('HEVC') || c.includes('H265')) return 'badge-codec-hevc';
+      if (c.includes('H264') || c.includes('AVC')) return 'badge-codec-h264';
+      if (c.includes('VP9')) return 'badge-codec-vp9';
+      if (c.includes('AV1')) return 'badge-codec-av1';
+      return 'badge-codec-mpeg';
+    }
+
+    function getCodecLabel(codec) {
+      const c = (codec || '').toUpperCase();
+      if (c.includes('HEVC') || c.includes('H265')) return 'HEVC';
+      if (c.includes('H264') || c.includes('AVC')) return 'H.264';
+      if (c.includes('VP9')) return 'VP9';
+      if (c.includes('AV1')) return 'AV1';
+      return codec || '—';
+    }
+
+    function normalizeTitleForGroup(s) {
+      if (!s || typeof s !== 'string') return '';
+      let name = s.replace(/\s*\[[^\]]*\]/g, '').replace(/\s*\(\d{4}\)/g, '').replace(/\.\d{4}(?=\D|$)/g, '').replace(/\b(19|20)\d{2}\b/g, '').replace(/\b(720p|1080p|2160p|4K|UHD|HD)\b/gi, '').replace(/\b(BluRay|WEB-DL|WEBRip|HDTV|BRRip|DVDRip|Remux|x264|x265|HEVC|H264|AAC|AC3|DTS)\b/gi, '').replace(/[\s._\-]+/g, ' ').trim();
+      return name.toLowerCase() || '';
+    }
+    function durationMatch(a, b, tol) {
+      tol = tol || 0.025;
+      a = Number(a) || 0; b = Number(b) || 0;
+      if (a <= 0 || b <= 0) return true;
+      return Math.abs(a - b) / Math.max(a, b) <= tol;
+    }
+    function buildDuplicateGroups(files) {
+      const byKey = {};
+      files.forEach(f => {
+        const key = normalizeTitleForGroup(f.metadata_title || '') || normalizeTitleForGroup(f.name) || (f.name || '').replace(/\.[^.]+$/, '').toLowerCase();
+        if (!key) return;
+        if (!byKey[key]) byKey[key] = [];
+        byKey[key].push(f);
+      });
+      const clusters = {};
+      Object.keys(byKey).forEach(k => {
+        const group = byKey[k];
+        if (group.length < 2) return;
+        const byDuration = [];
+        group.forEach(f => {
+          let placed = false;
+          for (let i = 0; i < byDuration.length; i++) {
+            if (byDuration[i].some(o => durationMatch(f.duration_sec, o.duration_sec))) { byDuration[i].push(f); placed = true; break; }
+          }
+          if (!placed) byDuration.push([f]);
+        });
+        byDuration.forEach(cluster => {
+          if (cluster.length < 2) return;
+          const sorted = cluster.slice().sort((a, b) => (b.size_bytes || 0) - (a.size_bytes || 0));
+          cluster.forEach(f => {
+            f.duplicateGroup = sorted.filter(o => o.path !== f.path);
+          });
+        });
+      });
+      return files;
+    }
+    function getHDRBadges(row) {
+      const badges = [];
+      const hdr = row.hdr === true;
+      const ct = (row.color_transfer || '').toLowerCase();
+      const cp = (row.color_primaries || '').toLowerCase();
+      const profile = (row.video_profile || '').toLowerCase();
+      const isDV = profile.includes('dolby') || ct.includes('smpte2084') && cp.includes('bt2020') && (profile.includes('dv') || profile.includes('dolby'));
+      if (isDV) badges.push({ label: 'Dolby Vision', cls: 'badge-dv' });
+      if (ct.includes('arib-std-b67')) badges.push({ label: 'HDR10+', cls: 'badge-hdr10plus' });
+      if (!isDV && (ct.includes('smpte2084') || ct.includes('arib-std-b67') || (hdr && (ct.includes('bt2020') || cp.includes('bt2020'))))) badges.push({ label: 'HDR', cls: 'badge-hdr' });
+      if (row.hdr === true && badges.length === 0) badges.push({ label: 'HDR', cls: 'badge-hdr' });
+      if (badges.length === 0) badges.push({ label: 'SDR', cls: 'badge-sdr' });
+      return badges;
+    }
+
+    const COLUMNS_PRO = [
+      { key: 'name', label: 'Fichier', cls: 'col-name', render: r => '<span title="' + escapeHtml(r.path) + '">' + escapeHtml(r.name) + '</span>' },
+      { key: 'film_attribuable', label: 'Film attribuable', cls: 'col-film', render: r => escapeHtml(r.film_attribuable || '—') },
+      { key: 'duration_sec', label: 'Durée', cls: 'col-num cell-duration', render: r => formatDurationHMS(r.duration_sec) },
+      { key: 'resolution', label: 'Résolution', cls: '', render: r => {
+        const w = r.width || 0, h = r.height || 0;
+        if (!w && !h) return '—';
+        const tier = getResolutionTier(h);
+        const px = w + '×' + h;
+        if (tier) return '<div class="cell-resolution"><span class="pixels">' + px + '</span><span class="badge ' + tier.cls + '">' + tier.tier + '</span></div>';
+        return '<span class="pixels">' + px + '</span>';
+      }},
+      { key: 'video_codec', label: 'Codec vidéo', cls: '', render: r => {
+        const codec = r.video_codec;
+        if (!codec) return '—';
+        return '<span class="badge ' + getCodecBadgeClass(codec) + '">' + escapeHtml(getCodecLabel(codec)) + '</span>';
+      }},
+      { key: 'hdr', label: 'HDR / Couleur', cls: '', render: r => {
+        const badges = getHDRBadges(r);
+        return '<div class="cell-badges">' + badges.map(b => '<span class="badge ' + b.cls + '">' + b.label + '</span>').join('') + '</div>';
+      }},
+      { key: 'video_bit_rate', label: 'Bitrate vidéo', cls: 'col-num', render: r => formatBitrateMbps(r.video_bit_rate) },
+      { key: 'size_bytes', label: 'Poids', cls: 'col-num', render: r => formatSizePro(r.size_bytes) },
+      { key: 'audio_tracks', label: 'Audio', cls: '', render: r => {
+        const tracks = r.audio_tracks || [];
+        if (!tracks.length) return '—';
+        return tracks.map(t => '<span class="badge badge-codec-mpeg" title="' + escapeHtml(t.channel_layout || '') + '">' + escapeHtml(t.codec || '') + (t.language ? ' ' + escapeHtml(t.language) : '') + (t.channels ? ' ' + t.channels + 'ch' : '') + '</span>').join(' ');
+      }},
+      { key: 'format_name', label: 'Conteneur', cls: '', render: r => '<span class="badge badge-container">' + escapeHtml(r.format_name || '—') + '</span>' },
+      { key: 'duplicateGroup', label: 'Doublons (même film)', cls: 'cell-doublons', render: r => {
+        const group = r.duplicateGroup || [];
+        if (!group.length) return '—';
+        return '<div class="cell-doublons">' + group.map(o => '<div class="doublon-item" title="' + escapeHtml(o.path) + '"><span class="doublon-name">' + escapeHtml(o.name) + '</span><span class="doublon-size">' + formatSizePro(o.size_bytes) + '</span></div>').join('') + '</div>';
+      }},
+    ];
+
+    document.querySelectorAll('.nav-link').forEach(link => {
+      link.addEventListener('click', e => {
+        e.preventDefault();
+        const page = link.dataset.page;
+        document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+        document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+        link.classList.add('active');
+        $(page === 'inventory' ? 'page-inventory' : 'page-settings').classList.add('active');
+      });
+    });
+
+    async function loadSettings() {
+      const res = await fetch('/api/settings');
+      const data = await res.json();
+      settingsPath.value = data.video_path || '';
+      scanPath.value = data.video_path || '';
+    }
+    async function saveSettings() {
+      const path = settingsPath.value.trim();
+      await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ video_path: path }) });
+      scanPath.value = path;
+    }
+    async function refreshFfmpeg(container) {
+      const res = await fetch('/api/ffmpeg');
+      const d = await res.json();
+      container.innerHTML = (d.installed ? '✓ FFmpeg installé' : '✗ FFmpeg non installé') + (d.ffprobe_path ? ' — ' + escapeHtml(d.ffprobe_path) : '');
+    }
+
+    function renderRow(row) {
+      return '<tr>' + COLUMNS_PRO.map(c => '<td class="' + (c.cls || '') + '">' + (c.render ? c.render(row) : escapeHtml(row[c.key])) + '</td>').join('') + '</tr>';
+    }
+
+    function getSortValue(row, key) {
+      const v = row[key];
+      if (key === 'duration_sec' || key === 'size_bytes' || key === 'video_bit_rate' || key === 'width' || key === 'height') return Number(v) || 0;
+      if (key === 'name' || key === 'film_attribuable' || key === 'format_name') return (v || '').toLowerCase();
+      if (key === 'video_codec') return (row.video_codec || '').toLowerCase();
+      if (key === 'resolution') return (row.height || 0);
+      if (key === 'hdr') return row.hdr ? 1 : 0;
+      if (key === 'duplicateGroup') return (row.duplicateGroup || []).length;
+      return (v != null ? String(v) : '').toLowerCase();
+    }
+
+    function renderTable(files, filterText) {
+      const withGroups = buildDuplicateGroups(files.slice());
+      const q = (filterText || '').toLowerCase().trim();
+      let filtered = q ? withGroups.filter(f => JSON.stringify(f).toLowerCase().includes(q)) : withGroups;
+      if (sortKey) {
+        filtered = filtered.slice().sort((a, b) => {
+          const va = getSortValue(a, sortKey);
+          const vb = getSortValue(b, sortKey);
+          const cmp = typeof va === 'number' && typeof vb === 'number' ? va - vb : String(va).localeCompare(String(vb));
+          return sortDir === 'asc' ? cmp : -cmp;
+        });
+      }
+      const sortIcon = (key) => {
+        if (sortKey !== key) return '<span class="sort-icon">↕</span>';
+        return '<span class="sort-icon">' + (sortDir === 'asc' ? '↑' : '↓') + '</span>';
+      };
+      tableHead.innerHTML = '<tr>' + COLUMNS_PRO.map((c) => {
+        const key = c.key;
+        const thClass = (c.cls || '') + (sortKey === key ? ' sorted' : '');
+        return '<th class="' + thClass + '" data-sort="' + escapeHtml(key) + '" title="Cliquer pour trier">' + escapeHtml(c.label) + sortIcon(key) + '</th>';
+      }).join('') + '</tr>';
+      tableBody.innerHTML = filtered.map(row => renderRow(row)).join('');
+    }
+
+    async function loadInventory() {
+      const res = await fetch('/api/inventory');
+      const data = await res.json();
+      const files = data.files || [];
+      if (files.length === 0) {
+        inventorySection.style.display = 'none';
+        inventoryMeta.style.display = 'none';
+        inventoryEmpty.style.display = 'block';
+        inventoryEmpty.textContent = 'Aucun inventaire enregistré. Lancez un scan pour remplir le tableau.';
+        return;
+      }
+      inventoryEmpty.style.display = 'none';
+      inventorySection.style.display = 'block';
+      inventoryMeta.style.display = 'flex';
+      inventoryMeta.innerHTML = '<div class="stat"><strong>' + files.length + '</strong> fichiers</div>' +
+        (data.scanned_path ? '<div class="stat">' + escapeHtml(data.scanned_path) + '</div>' : '') +
+        (data.scanned_at ? '<div class="stat">Scan : ' + escapeHtml(data.scanned_at) + '</div>' : '');
+      lastInventoryFiles = files;
+      renderTable(files, filterInput.value);
+    }
+
+    btnSaveSettings.addEventListener('click', async () => {
+      await saveSettings();
+      btnSaveSettings.textContent = 'Enregistré ✓';
+      setTimeout(() => { btnSaveSettings.textContent = 'Enregistrer'; }, 2000);
+    });
+
+    btnScan.addEventListener('click', async () => {
+      const path = scanPath.value.trim();
+      scanError.textContent = '';
+      if (!path) { scanError.textContent = 'Indiquez le chemin du dossier vidéo.'; return; }
+      scanTotalExpected = 0;
+      scanStatus.innerHTML = 'Préparation du scan…';
+      scanStatus.className = 'status-msg loading';
+      btnScan.disabled = true;
+      inventoryEmpty.style.display = 'none';
+      inventorySection.style.display = 'block';
+      inventoryMeta.style.display = 'flex';
+      inventoryMeta.innerHTML = '<div class="stat">Scan en cours…</div>';
+      lastInventoryFiles = [];
+      tableHead.innerHTML = '<tr>' + COLUMNS_PRO.map(c => '<th class="' + (c.cls || '') + '">' + escapeHtml(c.label) + '</th>').join('') + '</tr>';
+      tableBody.innerHTML = '';
+      try {
+        const res = await fetch('/api/scan-stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) });
+        if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || res.statusText); }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let total = 0;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const msg = JSON.parse(line);
+              if (msg.type === 'started') {
+                scanTotalExpected = msg.total_expected != null ? msg.total_expected : 0;
+                scanStatus.innerHTML = 'Scan en cours… <strong id="scan-count">0</strong> / <strong id="scan-total">' + scanTotalExpected + '</strong> fichier(s).';
+              } else if (msg.type === 'file' && msg.data) {
+                lastInventoryFiles.push(msg.data);
+                tableBody.insertAdjacentHTML('beforeend', renderRow(msg.data));
+                total++;
+                const countEl = $('scan-count');
+                if (countEl) countEl.textContent = total;
+              } else if (msg.type === 'done') {
+                total = msg.total != null ? msg.total : total;
+                const expected = msg.total_expected != null ? msg.total_expected : total;
+                inventoryMeta.innerHTML = '<div class="stat"><strong>' + total + '</strong> fichiers</div>';
+                if (total === expected && expected > 0) {
+                  scanStatus.innerHTML = 'Scan terminé. <strong>' + total + ' / ' + expected + '</strong> fichier(s) analysés (complet).';
+                } else if (expected > 0 && total < expected) {
+                  scanStatus.innerHTML = 'Scan terminé. <strong>' + total + ' / ' + expected + '</strong> fichier(s) analysés. <span style="color: var(--hdr10plus);">Attention : ' + (expected - total) + ' fichier(s) non analysé(s) (timeout ou erreur).</span>';
+                } else {
+                  scanStatus.innerHTML = 'Scan terminé. Inventaire enregistré (' + total + ' fichier(s)).';
+                }
+                scanStatus.className = 'status-msg';
+                renderTable(lastInventoryFiles, filterInput.value);
+              }
+            } catch (_) {}
+          }
+        }
+        if (buffer.trim()) {
+          try {
+            const msg = JSON.parse(buffer);
+            if (msg.type === 'started') { scanTotalExpected = msg.total_expected != null ? msg.total_expected : 0; scanStatus.innerHTML = 'Scan en cours… <strong id="scan-count">0</strong> / <strong id="scan-total">' + scanTotalExpected + '</strong> fichier(s).'; }
+            else if (msg.type === 'file' && msg.data) { lastInventoryFiles.push(msg.data); tableBody.insertAdjacentHTML('beforeend', renderRow(msg.data)); total++; }
+            else if (msg.type === 'done') {
+              total = msg.total != null ? msg.total : total;
+              const expected = msg.total_expected != null ? msg.total_expected : total;
+              inventoryMeta.innerHTML = '<div class="stat"><strong>' + total + '</strong> fichiers</div>';
+              if (total === expected && expected > 0) scanStatus.innerHTML = 'Scan terminé. <strong>' + total + ' / ' + expected + '</strong> fichier(s) analysés (complet).';
+              else if (expected > 0 && total < expected) scanStatus.innerHTML = 'Scan terminé. <strong>' + total + ' / ' + expected + '</strong> analysés. <span style="color: var(--hdr10plus);">' + (expected - total) + ' fichier(s) non analysé(s).</span>';
+              else scanStatus.innerHTML = 'Scan terminé. Inventaire enregistré (' + total + ' fichier(s)).';
+              scanStatus.className = 'status-msg';
+              renderTable(lastInventoryFiles, filterInput.value);
+            }
+          } catch (_) {}
+        }
+      } catch (e) {
+        scanError.textContent = e.message || 'Erreur.';
+        scanStatus.textContent = '';
+      } finally {
+        btnScan.disabled = false;
+      }
+    });
+
+    filterInput.addEventListener('input', () => {
+      if (lastInventoryFiles.length) renderTable(lastInventoryFiles, filterInput.value);
+    });
+
+    tableHead.addEventListener('click', (e) => {
+      const th = e.target.closest('th[data-sort]');
+      if (!th) return;
+      const key = th.getAttribute('data-sort');
+      if (sortKey === key) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+      else { sortKey = key; sortDir = 'asc'; }
+      renderTable(lastInventoryFiles, filterInput.value);
+    });
+
+    (async function init() {
+      await loadSettings();
+      await refreshFfmpeg($('ffmpeg-status'));
+      await refreshFfmpeg($('ffmpeg-settings'));
+      await loadInventory();
+    })();
+  </script>
+</body>
+</html>

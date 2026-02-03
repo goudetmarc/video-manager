@@ -1,0 +1,11 @@
+---
+description: Video Manager project scope — work only in this repo
+alwaysApply: true
+---
+
+# Video Manager — périmètre du projet
+
+- Le projet **Video Manager** est entièrement contenu dans ce dépôt : `Documents/PROJECTS/video-manager`.
+- Pour toute tâche liée à Video Manager, limiter les recherches, lectures et modifications **uniquement** à ce dossier (et sous-dossiers : `frontend/`, `static/`, etc.).
+- Ne pas chercher ni dépendre de fichiers en dehors du projet (home, Google Drive, autres projets, etc.).
+- Backend : FastAPI dans la racine (`main.py`, `scanner.py`, `config.py`). Frontend : Next.js dans `frontend/`.
