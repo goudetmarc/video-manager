@@ -71,7 +71,7 @@ app = FastAPI(title="Video Manager", description="Inventaire vidéo persistant")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:3005", "http://127.0.0.1:3005"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -986,7 +986,10 @@ def api_get_inventory(force_refresh: bool = False):
     if not force_refresh:
         cached = inventory_cache.get(cache_key)
         if cached is not None:
+            print(f"[CACHE HIT] inventory:all - Returning cached data ({len(cached.get('files', []))} files)")
             return cached
+
+    print(f"[CACHE MISS] inventory:all - Loading from database (force_refresh={force_refresh})")
 
     # Load from database
     inv = load_inventory()
@@ -1002,8 +1005,9 @@ def api_get_inventory(force_refresh: bool = False):
             elif _poster_local_path(tmdb_id).exists():
                 f["poster_url"] = f"/static/posters/{tmdb_id}.jpg"
 
-    # Cache result for 5 minutes
-    inventory_cache.set(cache_key, inv, ttl=300)
+    # Cache result for 1 hour
+    inventory_cache.set(cache_key, inv, ttl=3600)
+    print(f"[CACHE SET] inventory:all - Cached {len(files)} files for 3600s (1 hour)")
 
     return inv
 
@@ -1212,7 +1216,10 @@ def api_get_series(force_refresh: bool = False):
     if not force_refresh:
         cached = series_cache.get(cache_key)
         if cached is not None:
+            print(f"[CACHE HIT] series:all - Returning cached data ({cached.get('total', 0)} series)")
             return cached
+
+    print(f"[CACHE MISS] series:all - Loading from database (force_refresh={force_refresh})")
 
     # Load from database
     inv = load_inventory()
@@ -1225,8 +1232,9 @@ def api_get_series(force_refresh: bool = False):
         "total": len(series_list),
     }
 
-    # Cache result for 5 minutes
-    series_cache.set(cache_key, result, ttl=300)
+    # Cache result for 1 hour
+    series_cache.set(cache_key, result, ttl=3600)
+    print(f"[CACHE SET] series:all - Cached {len(series_list)} series for 3600s (1 hour)")
 
     return result
 
@@ -1340,6 +1348,456 @@ def api_get_series_detail(series_id: str):
         "watched_count": sum(1 for ep in matching_episodes if ep.get("watched")),
         "seasons": seasons_list,
     }
+
+
+@app.post("/api/series/organize")
+def api_organize_series(body: dict = Body(...)):
+    """
+    Organize TV series: flatten folders, rename files, remove duplicates and junk.
+    Streams progress as NDJSON (Server-Sent Events).
+
+    Body:
+        dry_run: bool - If True, only simulate changes without actually modifying files
+    """
+    dry_run = body.get("dry_run", False)
+    settings_data = load_settings()
+    series_path = settings_data.get("series_path", "").strip()
+
+    if not series_path:
+        raise HTTPException(status_code=400, detail="series_path not configured in settings")
+
+    if not Path(series_path).is_dir():
+        raise HTTPException(status_code=400, detail=f"Series directory not found: {series_path}")
+
+    def stream_organize():
+        """Stream organization progress."""
+        from collections import defaultdict
+
+        VIDEO_EXTS = {'.mkv', '.mp4', '.avi', '.m4v', '.wmv', '.mov'}
+        JUNK_EXTS = {'.nfo', '.txt', '.srt', '.sub', '.idx', '.jpg', '.jpeg', '.png', '.gif', '.sfv', '.md5'}
+        SAMPLE_PATTERNS = [r'\.sample\.', r'-sample\.', r'_sample\.', r'\bsample\b']
+        SKIP_FOLDERS = {'#recycle', '@eaDir', '.'}
+
+        stats = {
+            'videos_found': 0,
+            'samples_deleted': 0,
+            'junk_deleted': 0,
+            'duplicates_removed': 0,
+            'files_moved': 0,
+            'files_renamed': 0,
+            'folders_removed': 0,
+            'folders_merged': 0,
+            'folders_renamed': 0,
+            'errors': []
+        }
+
+        def is_sample(filename):
+            """Check if file is a sample."""
+            lower = filename.lower()
+            return any(re.search(p, lower) for p in SAMPLE_PATTERNS)
+
+        def parse_episode_info(filename):
+            """Extract series name, season, episode, and title from filename."""
+            patterns = [
+                r'^(.+?)[.\s_-]+[Ss](\d{1,2})[Ee](\d{1,2})(?:[Ee]\d{1,2})?[.\s_-]*(.*)$',
+                r'^(.+?)[.\s_-]+(\d{1,2})x(\d{1,2})[.\s_-]*(.*)$',
+            ]
+
+            base = os.path.splitext(filename)[0]
+
+            for pattern in patterns:
+                match = re.match(pattern, base, re.IGNORECASE)
+                if match:
+                    series = match.group(1).replace('.', ' ').replace('_', ' ').strip()
+                    season = int(match.group(2))
+                    episode = int(match.group(3))
+                    title = match.group(4) if match.group(4) else ''
+
+                    # Clean up title
+                    title = re.sub(r'[.\s_-]*(1080p|720p|480p|2160p|WEB-DL|WEBRip|BluRay|HDTV|DVDRip|BDRip|REMUX|x264|x265|H\.?264|H\.?265|HEVC|AAC|DD5\.?1|DDP5\.?1|DTS|FLAC|LPCM|AVC|WEB|HDR).*$', '', title, flags=re.IGNORECASE)
+                    title = re.sub(r'[.\s_-]+(DEFLATE|NTb|NTG|ROVERS|SiGMA|ION10|STRiFE|KiNGS|Monkee|D3g|EPSiLON|FLUX|RARBG|BTN|DIMENSION|Lord123|MRN|AJP69|SbR|BLUTONiUM).*$', '', title, flags=re.IGNORECASE)
+                    title = title.replace('.', ' ').replace('_', ' ').strip(' -')
+
+                    # Remove year patterns
+                    series = re.sub(r'\s*\(\d{4}\)\s*$', '', series)
+                    series = re.sub(r'\s*\d{4}\s*$', '', series)
+
+                    return series, season, episode, title
+
+            return None, None, None, None
+
+        def get_quality_score(filename):
+            """Higher score = better quality."""
+            lower = filename.lower()
+            score = 0
+
+            if '2160p' in lower or '4k' in lower:
+                score += 1000
+            elif '1080p' in lower:
+                score += 500
+            elif '720p' in lower:
+                score += 200
+            elif '480p' in lower:
+                score += 100
+
+            if 'remux' in lower:
+                score += 50
+            if 'bluray' in lower:
+                score += 30
+            elif 'web-dl' in lower:
+                score += 25
+            elif 'webrip' in lower:
+                score += 20
+            elif 'hdtv' in lower:
+                score += 10
+            elif 'dvdrip' in lower:
+                score += 5
+
+            if 'x265' in lower or 'h.265' in lower or 'hevc' in lower:
+                score += 10
+
+            return score
+
+        def clean_series_name(folder_name):
+            """Get a clean series name from the folder name."""
+            name = folder_name
+
+            # Remove hash tags
+            name = re.sub(r'\{\{.*\}\}', '', name)
+
+            # Replace dots and underscores with spaces
+            name = name.replace('.', ' ').replace('_', ' ')
+
+            # Remove quality/season markers
+            name = re.sub(r'\s+(S\d{1,2}|Season\s*\d+)\b.*$', '', name, flags=re.IGNORECASE)
+            name = re.sub(r'\s+(1080p|720p|480p|2160p|4K)\b.*$', '', name, flags=re.IGNORECASE)
+            name = re.sub(r'\s+(WEB-DL|WEBRip|BluRay|HDTV|DVDRip|BDRip|REMUX|WEB)\b.*$', '', name, flags=re.IGNORECASE)
+            name = re.sub(r'\s+(x264|x265|H\.?264|H\.?265|HEVC|AVC)\b.*$', '', name, flags=re.IGNORECASE)
+            name = re.sub(r'\s+(INTEGRALE|COMPLETE|INTÉGRALE)\b.*$', '', name, flags=re.IGNORECASE)
+            name = re.sub(r'\s+(FRENCH|ENGLISH|VOSTFR|MULTI|MULTi|DUAL)\b.*$', '', name, flags=re.IGNORECASE)
+
+            # Remove years
+            name = re.sub(r'\s*\(\d{4}\)\s*$', '', name)
+            name = re.sub(r'\s+\d{4}\s*$', '', name)
+            name = re.sub(r'\s+265\s*$', '', name)
+
+            # Clean up multiple spaces
+            name = re.sub(r'\s+', ' ', name).strip()
+
+            return name
+
+        def normalize_series_name(name):
+            """Normalize a series name for grouping."""
+            n = name.lower()
+            n = re.sub(r'[.\s_-]*(s\d{1,2}|season\s*\d+).*$', '', n, flags=re.IGNORECASE)
+            n = re.sub(r'[.\s_-]*(1080p|720p|480p|2160p|4k|web-dl|webrip|bluray|hdtv|dvdrip|remux|x264|x265|h\.?264|h\.?265|hevc|french|english|vostfr|multi|complete|integrale|intégrale).*$', '', n, flags=re.IGNORECASE)
+            n = re.sub(r'\s*\(?\d{4}\)?', '', n)
+            n = re.sub(r'\{\{.*\}\}', '', n)
+            n = re.sub(r'[.\s_-]+', ' ', n).strip()
+            return n
+
+        def find_best_folder_name(folders):
+            """Pick the cleanest folder name from a group."""
+            def score(name):
+                s = 0
+                if '.' in name or '_' in name:
+                    s -= 10
+                if re.search(r'(1080p|720p|WEB|BluRay|x264|x265)', name, re.IGNORECASE):
+                    s -= 20
+                if re.search(r'S\d{2}', name):
+                    s -= 15
+                s -= len(name) / 10
+                return s
+
+            return max(folders, key=score)
+
+        yield json.dumps({"type": "started", "dry_run": dry_run, "series_path": series_path}, ensure_ascii=False) + "\n"
+
+        # Phase 0: Merge folders for the same series
+        yield json.dumps({"type": "phase", "phase": 0, "name": "Merging series folders"}, ensure_ascii=False) + "\n"
+
+        all_folders = [d for d in os.listdir(series_path)
+                       if os.path.isdir(os.path.join(series_path, d)) and d not in SKIP_FOLDERS]
+
+        folder_groups = defaultdict(list)
+        for folder in all_folders:
+            normalized = normalize_series_name(folder)
+            if normalized:
+                folder_groups[normalized].append(folder)
+
+        for normalized, folders in folder_groups.items():
+            if len(folders) > 1:
+                best_name = find_best_folder_name(folders)
+                best_path = os.path.join(series_path, best_name)
+                yield json.dumps({"type": "info", "message": f"Merging {len(folders)} folders for '{normalized}' into '{best_name}'"}, ensure_ascii=False) + "\n"
+
+                for folder in folders:
+                    if folder == best_name:
+                        continue
+                    folder_path = os.path.join(series_path, folder)
+
+                    if not dry_run:
+                        for item in os.listdir(folder_path):
+                            if item.startswith('.'):
+                                continue
+                            src = os.path.join(folder_path, item)
+                            dest = os.path.join(best_path, item)
+
+                            if os.path.exists(dest):
+                                if os.path.isdir(src) and os.path.isdir(dest):
+                                    for sub_item in os.listdir(src):
+                                        sub_src = os.path.join(src, sub_item)
+                                        sub_dest = os.path.join(dest, sub_item)
+                                        if not os.path.exists(sub_dest):
+                                            try:
+                                                shutil.move(sub_src, sub_dest)
+                                            except Exception as e:
+                                                stats['errors'].append(f"Error moving {sub_src}: {e}")
+                                elif os.path.isfile(src) and os.path.isfile(dest):
+                                    if os.path.getsize(src) > os.path.getsize(dest):
+                                        os.remove(dest)
+                                        shutil.move(src, dest)
+                            else:
+                                try:
+                                    shutil.move(src, dest)
+                                except Exception as e:
+                                    stats['errors'].append(f"Error moving {src}: {e}")
+
+                        try:
+                            shutil.rmtree(folder_path)
+                            stats['folders_merged'] += 1
+                        except Exception as e:
+                            stats['errors'].append(f"Error removing folder {folder_path}: {e}")
+                    else:
+                        stats['folders_merged'] += 1
+
+        # Phase 1: Delete samples and junk
+        yield json.dumps({"type": "phase", "phase": 1, "name": "Deleting samples and junk files"}, ensure_ascii=False) + "\n"
+
+        for root, dirs, files in os.walk(series_path):
+            dirs[:] = [d for d in dirs if d not in SKIP_FOLDERS]
+
+            for f in files:
+                filepath = os.path.join(root, f)
+                ext = os.path.splitext(f)[1].lower()
+
+                if ext in JUNK_EXTS:
+                    if not dry_run:
+                        try:
+                            os.remove(filepath)
+                            stats['junk_deleted'] += 1
+                            yield json.dumps({"type": "delete", "file": f, "reason": "junk"}, ensure_ascii=False) + "\n"
+                        except Exception as e:
+                            stats['errors'].append(f"Error deleting {filepath}: {e}")
+                    else:
+                        stats['junk_deleted'] += 1
+                    continue
+
+                if ext in VIDEO_EXTS and is_sample(f):
+                    if not dry_run:
+                        try:
+                            os.remove(filepath)
+                            stats['samples_deleted'] += 1
+                            yield json.dumps({"type": "delete", "file": f, "reason": "sample"}, ensure_ascii=False) + "\n"
+                        except Exception as e:
+                            stats['errors'].append(f"Error deleting {filepath}: {e}")
+                    else:
+                        stats['samples_deleted'] += 1
+
+        # Phase 2: Collect and organize videos
+        yield json.dumps({"type": "phase", "phase": 2, "name": "Collecting and organizing video files"}, ensure_ascii=False) + "\n"
+
+        series_folders = [d for d in os.listdir(series_path)
+                          if os.path.isdir(os.path.join(series_path, d)) and d not in SKIP_FOLDERS]
+
+        for series_folder in sorted(series_folders):
+            series_folder_path = os.path.join(series_path, series_folder)
+            series_name = clean_series_name(series_folder)
+
+            yield json.dumps({"type": "processing", "folder": series_folder}, ensure_ascii=False) + "\n"
+
+            # Collect all video files
+            videos = []
+            for root, dirs, files in os.walk(series_folder_path):
+                dirs[:] = [d for d in dirs if d not in SKIP_FOLDERS]
+                for f in files:
+                    ext = os.path.splitext(f)[1].lower()
+                    if ext in VIDEO_EXTS and not is_sample(f):
+                        filepath = os.path.join(root, f)
+                        size = os.path.getsize(filepath)
+                        videos.append({
+                            'path': filepath,
+                            'filename': f,
+                            'size': size,
+                            'ext': ext,
+                            'quality': get_quality_score(f)
+                        })
+
+            stats['videos_found'] += len(videos)
+
+            # Group by episode
+            episodes = defaultdict(list)
+            for v in videos:
+                _, season, episode, title = parse_episode_info(v['filename'])
+                if season is not None:
+                    key = (season, episode)
+                    v['parsed_title'] = title
+                    v['parsed_season'] = season
+                    v['parsed_episode'] = episode
+                    episodes[key].append(v)
+                else:
+                    episodes[('unparsed', v['filename'])].append(v)
+
+            # Process each episode
+            for key, versions in episodes.items():
+                if key[0] == 'unparsed':
+                    v = versions[0]
+                    if os.path.dirname(v['path']) != series_folder_path:
+                        dest = os.path.join(series_folder_path, v['filename'])
+                        if not os.path.exists(dest):
+                            if not dry_run:
+                                try:
+                                    shutil.move(v['path'], dest)
+                                    stats['files_moved'] += 1
+                                except Exception as e:
+                                    stats['errors'].append(f"Error moving {v['path']}: {e}")
+                            else:
+                                stats['files_moved'] += 1
+                    continue
+
+                season, episode = key
+                versions.sort(key=lambda x: (x['quality'], x['size']), reverse=True)
+
+                best = versions[0]
+
+                # Delete duplicates
+                for v in versions[1:]:
+                    if not dry_run:
+                        try:
+                            os.remove(v['path'])
+                            stats['duplicates_removed'] += 1
+                            yield json.dumps({"type": "duplicate", "file": v['filename']}, ensure_ascii=False) + "\n"
+                        except Exception as e:
+                            stats['errors'].append(f"Error removing duplicate {v['path']}: {e}")
+                    else:
+                        stats['duplicates_removed'] += 1
+
+                # Build new filename
+                title_part = f" - {best['parsed_title']}" if best.get('parsed_title') else ""
+                new_filename = f"{series_name} - S{season:02d}E{episode:02d}{title_part}{best['ext']}"
+                new_filename = re.sub(r'[<>:"/\\|?*]', '', new_filename)
+
+                dest_path = os.path.join(series_folder_path, new_filename)
+
+                # Move/rename
+                if best['path'] != dest_path:
+                    if os.path.exists(dest_path):
+                        if os.path.getsize(dest_path) >= best['size']:
+                            if not dry_run:
+                                try:
+                                    os.remove(best['path'])
+                                    stats['duplicates_removed'] += 1
+                                except:
+                                    pass
+                            else:
+                                stats['duplicates_removed'] += 1
+                            continue
+                        else:
+                            if not dry_run:
+                                try:
+                                    os.remove(dest_path)
+                                except:
+                                    pass
+
+                    if not dry_run:
+                        try:
+                            shutil.move(best['path'], dest_path)
+                            if os.path.dirname(best['path']) != series_folder_path:
+                                stats['files_moved'] += 1
+                            stats['files_renamed'] += 1
+                            yield json.dumps({"type": "rename", "old": os.path.basename(best['path']), "new": new_filename}, ensure_ascii=False) + "\n"
+                        except Exception as e:
+                            stats['errors'].append(f"Error moving {best['path']}: {e}")
+                    else:
+                        if os.path.dirname(best['path']) != series_folder_path:
+                            stats['files_moved'] += 1
+                        stats['files_renamed'] += 1
+
+        # Phase 3: Remove empty directories
+        yield json.dumps({"type": "phase", "phase": 3, "name": "Removing empty directories"}, ensure_ascii=False) + "\n"
+
+        for series_folder in sorted(series_folders):
+            series_folder_path = os.path.join(series_path, series_folder)
+
+            for root, dirs, files in os.walk(series_folder_path, topdown=False):
+                dirs[:] = [d for d in dirs if d not in SKIP_FOLDERS]
+
+                if root == series_folder_path:
+                    continue
+
+                remaining = [f for f in os.listdir(root) if not f.startswith('.')]
+                if not remaining:
+                    if not dry_run:
+                        try:
+                            shutil.rmtree(root)
+                            stats['folders_removed'] += 1
+                            yield json.dumps({"type": "folder_removed", "folder": root}, ensure_ascii=False) + "\n"
+                        except Exception as e:
+                            stats['errors'].append(f"Error removing folder {root}: {e}")
+                    else:
+                        stats['folders_removed'] += 1
+
+        # Phase 4: Rename ugly series folders
+        yield json.dumps({"type": "phase", "phase": 4, "name": "Renaming series folders"}, ensure_ascii=False) + "\n"
+
+        current_folders = [d for d in os.listdir(series_path)
+                           if os.path.isdir(os.path.join(series_path, d)) and d not in SKIP_FOLDERS]
+
+        for folder in sorted(current_folders):
+            clean = clean_series_name(folder)
+
+            if clean != folder and clean:
+                old_path = os.path.join(series_path, folder)
+                new_path = os.path.join(series_path, clean)
+
+                if os.path.exists(new_path):
+                    yield json.dumps({"type": "info", "message": f"Merging '{folder}' into existing '{clean}'"}, ensure_ascii=False) + "\n"
+                    if not dry_run:
+                        for item in os.listdir(old_path):
+                            if item.startswith('.'):
+                                continue
+                            src = os.path.join(old_path, item)
+                            dest = os.path.join(new_path, item)
+                            if not os.path.exists(dest):
+                                try:
+                                    shutil.move(src, dest)
+                                except Exception as e:
+                                    stats['errors'].append(f"Error moving {src}: {e}")
+                        try:
+                            shutil.rmtree(old_path)
+                            stats['folders_renamed'] += 1
+                        except Exception as e:
+                            stats['errors'].append(f"Error removing {old_path}: {e}")
+                    else:
+                        stats['folders_renamed'] += 1
+                else:
+                    if not dry_run:
+                        try:
+                            os.rename(old_path, new_path)
+                            stats['folders_renamed'] += 1
+                            yield json.dumps({"type": "folder_rename", "old": folder, "new": clean}, ensure_ascii=False) + "\n"
+                        except Exception as e:
+                            stats['errors'].append(f"Error renaming {old_path}: {e}")
+                    else:
+                        stats['folders_renamed'] += 1
+
+        # Send summary
+        yield json.dumps({
+            "type": "completed",
+            "stats": stats
+        }, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(stream_organize(), media_type="application/x-ndjson")
 
 
 @app.get("/api/raw-inventory")
@@ -4532,6 +4990,496 @@ def api_ffmpeg_status():
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+# =============================================================================
+# Streaming Catalogs API (TMDB)
+# =============================================================================
+
+@app.get("/api/streaming/catalog/{platform}")
+async def api_streaming_catalog(
+    platform: str,
+    content_type: str = Query("movie", pattern="^(movie|tv)$"),
+    page: int = Query(1, ge=1, le=500),
+    region: str = "FR",
+):
+    """
+    Get streaming platform catalog via TMDB discover.
+    Platforms: netflix, prime, disney, apple
+    Content types: movie, tv
+    """
+    platform = platform.lower()
+    if platform not in ("netflix", "prime", "disney", "apple"):
+        raise HTTPException(status_code=400, detail="Invalid platform")
+    try:
+        from tmdb_streaming import get_platform_catalog
+        return await get_platform_catalog(
+            platform=platform,
+            content_type=content_type,
+            region=region,
+            page=page,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
+
+
+@app.get("/api/streaming/trending")
+async def api_streaming_trending(
+    content_type: str = Query("all", pattern="^(all|movie|tv)$"),
+    time_window: str = Query("week", pattern="^(day|week)$"),
+):
+    """Contenu tendance toutes plateformes."""
+    try:
+        from tmdb_streaming import get_trending
+        return await get_trending(content_type, time_window)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
+
+
+@app.get("/api/streaming/search")
+async def api_streaming_search(
+    query: str = Query(..., min_length=1),
+    page: int = Query(1, ge=1, le=500),
+):
+    """Recherche multi-plateformes via TMDB."""
+    try:
+        from tmdb_streaming import search_multi
+        return await search_multi(query.strip(), page)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
+
+
+# =============================================================================
+# Discovery API (exploration par connexions)
+# =============================================================================
+
+@app.get("/api/discovery/weekly/{platform}")
+async def api_discovery_weekly(
+    platform: str,
+    content_type: str = Query("movie", pattern="^(movie|tv)$"),
+    days: int = Query(7, ge=1, le=30),
+):
+    """Nouveautés de la semaine sur une plateforme."""
+    platform = platform.lower()
+    if platform not in ("netflix", "prime", "disney", "apple"):
+        raise HTTPException(status_code=400, detail="Invalid platform")
+    try:
+        from tmdb_discovery import get_weekly_new
+        return await get_weekly_new(platform, content_type, days, per_page=100)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
+
+
+@app.get("/api/discovery/person/search")
+async def api_discovery_person_search(query: str = Query(..., min_length=1)):
+    """Chercher un réalisateur ou acteur."""
+    try:
+        from tmdb_discovery import search_person
+        return await search_person(query.strip())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
+
+
+@app.get("/api/discovery/person/{person_id}/credits")
+async def api_discovery_person_credits(
+    person_id: int,
+    role: str = Query("all", pattern="^(all|directing|acting|writing)$"),
+):
+    """Filmographie d'une personne (filtrable par rôle)."""
+    try:
+        from tmdb_discovery import get_person_credits
+        return await get_person_credits(person_id, role)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
+
+
+@app.get("/api/discovery/genres")
+async def api_discovery_genres(
+    content_type: str = Query("movie", pattern="^(movie|tv)$"),
+):
+    """Liste des genres disponibles."""
+    try:
+        from tmdb_discovery import get_genres
+        return await get_genres(content_type)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
+
+
+@app.get("/api/discovery/discover/genre-era")
+async def api_discovery_genre_era(
+    genre_ids: str = Query(..., description="IDs séparés par virgule"),
+    year_from: int | None = Query(None),
+    year_to: int | None = Query(None),
+    content_type: str = Query("movie", pattern="^(movie|tv)$"),
+):
+    """Découvrir par genre + époque (ex: Thrillers années 80)."""
+    try:
+        from tmdb_discovery import discover_by_genre_era
+        genre_list = [int(g.strip()) for g in genre_ids.split(",") if g.strip()]
+        if not genre_list:
+            raise HTTPException(status_code=400, detail="genre_ids required")
+        return await discover_by_genre_era(genre_list, year_from, year_to, content_type, per_page=100)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
+
+
+@app.get("/api/discovery/collections/popular")
+def api_discovery_collections_popular():
+    """Collections populaires (Ghibli, Batman, Astérix...)."""
+    from tmdb_discovery import get_popular_collections
+    return get_popular_collections()
+
+
+@app.get("/api/discovery/collections/search")
+async def api_discovery_collections_search(query: str = Query(..., min_length=1)):
+    """Chercher une collection."""
+    try:
+        from tmdb_discovery import search_collection
+        return await search_collection(query.strip())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
+
+
+@app.get("/api/discovery/collections/{collection_id}")
+async def api_discovery_collection_details(collection_id: int):
+    """Détails d'une collection (tous les films)."""
+    try:
+        from tmdb_discovery import get_collection_details
+        return await get_collection_details(collection_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
+
+
+@app.get("/api/discovery/studio/{company_id}")
+async def api_discovery_studio(company_id: int):
+    """Films d'un studio (ex: Ghibli = 10342)."""
+    try:
+        from tmdb_discovery import get_studio_films
+        return await get_studio_films(company_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
+
+
+@app.get("/api/discovery/{content_type}/{item_id}/similar")
+async def api_discovery_similar(item_id: int, content_type: str = "movie"):
+    """Films similaires."""
+    if content_type not in ("movie", "tv"):
+        raise HTTPException(status_code=400, detail="content_type must be movie or tv")
+    try:
+        from tmdb_discovery import get_similar
+        return await get_similar(item_id, content_type)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
+
+
+@app.get("/api/discovery/{content_type}/{item_id}/recommendations")
+async def api_discovery_recommendations(item_id: int, content_type: str = "movie"):
+    """Recommandations basées sur un film."""
+    if content_type not in ("movie", "tv"):
+        raise HTTPException(status_code=400, detail="content_type must be movie or tv")
+    try:
+        from tmdb_discovery import get_recommendations
+        return await get_recommendations(item_id, content_type)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
+
+
+# Wishlist API (Supabase)
+WISHLIST_USER_ID = "default"  # Single-user mode until auth
+
+
+def _load_wishlist_supabase() -> list:
+    """Charge la wishlist depuis Supabase."""
+    client = get_supabase_client()
+    if not client:
+        return []
+    try:
+        r = (
+            client.table("wishlist")
+            .select("*")
+            .eq("user_id", WISHLIST_USER_ID)
+            .order("added_at", desc=True)
+            .execute()
+        )
+        return r.data or []
+    except Exception:
+        return []
+
+
+def _save_wishlist_item_supabase(tmdb_id: int, media_type: str, platform: str, title: str, poster_path: str) -> tuple[bool, str | None]:
+    """Ajoute un item à la wishlist Supabase. Retourne (ok, error_message)."""
+    client = get_supabase_client()
+    if not client:
+        return False, "Supabase non configuré"
+    row = {
+        "user_id": WISHLIST_USER_ID,
+        "tmdb_id": tmdb_id,
+        "media_type": media_type,
+        "platform": platform,
+        "title": title,
+        "poster_path": poster_path or "",
+    }
+    try:
+        client.table("wishlist").insert(row).execute()
+        return True, None
+    except Exception as e:
+        err_msg = str(e)
+        err_lower = err_msg.lower()
+        if "duplicate" in err_lower or "unique" in err_lower or "23505" in err_msg:
+            return True, None
+        return False, err_msg
+
+
+def _remove_wishlist_item_supabase(item_id: str) -> bool:
+    """Supprime un item de la wishlist Supabase."""
+    client = get_supabase_client()
+    if not client:
+        return False
+    try:
+        client.table("wishlist").delete().eq("id", item_id).eq("user_id", WISHLIST_USER_ID).execute()
+        return True
+    except Exception:
+        return False
+
+
+@app.get("/api/streaming/wishlist")
+def api_wishlist_get():
+    """Get wishlist items. storage: 'supabase' | 'local' indique la source."""
+    if not is_supabase_enabled():
+        return {"items": [], "storage": "local"}
+    try:
+        items = _load_wishlist_supabase()
+        # Normaliser pour le frontend (id string, format WishlistItem)
+        normalized = [
+            {
+                "id": str(row["id"]),
+                "tmdb_id": row["tmdb_id"],
+                "media_type": row.get("media_type", "movie"),
+                "platform": row["platform"],
+                "title": row["title"],
+                "poster_path": row.get("poster_path") or "",
+            }
+            for row in items
+        ]
+        return {"items": normalized, "storage": "supabase"}
+    except Exception:
+        return {"items": [], "storage": "local"}
+
+
+@app.post("/api/streaming/wishlist")
+def api_wishlist_add(body: dict = Body(...)):
+    """Add item to wishlist. Body: {tmdb_id, media_type?, platform, title, poster_path?}"""
+    if not is_supabase_enabled():
+        raise HTTPException(status_code=503, detail="Supabase non configuré pour la wishlist")
+    tmdb_id = body.get("tmdb_id")
+    if tmdb_id is None:
+        raise HTTPException(status_code=400, detail="tmdb_id required")
+    media_type = body.get("media_type", "movie")
+    platform = body.get("platform", "discovery")
+    title = body.get("title", "")
+    poster_path = body.get("poster_path") or body.get("poster_url") or ""
+    ok, err = _save_wishlist_item_supabase(int(tmdb_id), media_type, platform, title, poster_path)
+    if not ok:
+        raise HTTPException(status_code=500, detail=err or "Erreur lors de l'ajout")
+    return {"ok": True}
+
+
+@app.delete("/api/streaming/wishlist/{item_id}")
+def api_wishlist_remove(item_id: str):
+    """Remove item from wishlist."""
+    if not is_supabase_enabled():
+        raise HTTPException(status_code=503, detail="Supabase non configuré pour la wishlist")
+    ok = _remove_wishlist_item_supabase(item_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Erreur lors de la suppression")
+    return {"ok": True}
+
+
+# =============================================================================
+# Radarr - Auto-téléchargement depuis wishlist
+# =============================================================================
+
+@app.get("/api/radarr/status")
+async def api_radarr_status():
+    """Vérifier que Radarr est accessible."""
+    try:
+        from radarr_service import test_radarr_connection
+        is_connected = await test_radarr_connection()
+        if not is_connected:
+            raise HTTPException(status_code=503, detail="Radarr inaccessible. Vérifiez RADARR_URL et RADARR_API_KEY")
+        return {"status": "connected", "message": "Radarr est accessible"}
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/api/radarr/quality-profiles")
+async def api_radarr_quality_profiles():
+    """Liste des profils qualité disponibles dans Radarr."""
+    try:
+        from radarr_service import get_radarr_quality_profiles
+        profiles = await get_radarr_quality_profiles()
+        return {"profiles": profiles}
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/api/radarr/add-movie")
+async def api_radarr_add_movie(body: dict = Body(...)):
+    """Ajouter un film à Radarr depuis la wishlist. Lance recherche et téléchargement."""
+    tmdb_id = body.get("tmdb_id")
+    title = body.get("title", "")
+    quality_profile_id = body.get("quality_profile_id", 1)
+    search_immediately = body.get("search_immediately", True)
+    if tmdb_id is None:
+        raise HTTPException(status_code=400, detail="tmdb_id requis")
+    try:
+        from radarr_service import add_movie_to_radarr
+        result = await add_movie_to_radarr(
+            tmdb_id=int(tmdb_id),
+            title=title,
+            quality_profile_id=int(quality_profile_id),
+            search_for_movie=search_immediately,
+        )
+        if not result.get("success") and not result.get("already_exists"):
+            raise HTTPException(status_code=400, detail=result.get("message", "Erreur Radarr"))
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/api/radarr/movie/{tmdb_id}")
+async def api_radarr_check_movie(tmdb_id: int):
+    """Vérifier si un film est déjà dans Radarr."""
+    try:
+        from radarr_service import search_movie_in_radarr
+        movie = await search_movie_in_radarr(tmdb_id)
+        return {
+            "in_radarr": movie is not None,
+            "movie": movie,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/api/radarr/movie/{radarr_id}/status")
+async def api_radarr_movie_status(radarr_id: int):
+    """Obtenir le statut de téléchargement d'un film."""
+    try:
+        from radarr_service import get_radarr_movie_status
+        status = await get_radarr_movie_status(radarr_id)
+        if not status:
+            raise HTTPException(status_code=404, detail="Film introuvable dans Radarr")
+        return {
+            "title": status.get("title"),
+            "has_file": status.get("hasFile", False),
+            "monitored": status.get("monitored", False),
+            "status": status.get("status", "unknown"),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+# =============================================================================
+# Sonarr - Auto-téléchargement des séries depuis wishlist
+# =============================================================================
+
+@app.get("/api/sonarr/status")
+async def api_sonarr_status():
+    """Vérifier que Sonarr est accessible."""
+    try:
+        from sonarr_service import test_sonarr_connection
+        is_connected = await test_sonarr_connection()
+        if not is_connected:
+            raise HTTPException(status_code=503, detail="Sonarr inaccessible. Vérifiez SONARR_URL et SONARR_API_KEY")
+        return {"status": "connected", "message": "Sonarr est accessible"}
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/api/sonarr/quality-profiles")
+async def api_sonarr_quality_profiles():
+    """Liste des profils qualité disponibles dans Sonarr."""
+    try:
+        from sonarr_service import get_sonarr_quality_profiles
+        profiles = await get_sonarr_quality_profiles()
+        return {"profiles": profiles}
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/api/sonarr/add-series")
+async def api_sonarr_add_series(body: dict = Body(...)):
+    """
+    Ajouter une série à Sonarr depuis la wishlist.
+    Lance la recherche de TOUS les épisodes manquants (toutes saisons)
+    dans la meilleure qualité selon le profil Sonarr.
+    """
+    tmdb_id = body.get("tmdb_id")
+    title = body.get("title", "")
+    quality_profile_id = body.get("quality_profile_id", 1)
+    search_for_missing_episodes = body.get("search_for_missing_episodes", True)
+    if tmdb_id is None:
+        raise HTTPException(status_code=400, detail="tmdb_id requis")
+    try:
+        from sonarr_service import add_series_to_sonarr
+        result = await add_series_to_sonarr(
+            tmdb_id=int(tmdb_id),
+            title=title,
+            quality_profile_id=int(quality_profile_id),
+            search_for_missing_episodes=search_for_missing_episodes,
+        )
+        if not result.get("success") and not result.get("already_exists"):
+            raise HTTPException(status_code=400, detail=result.get("message", "Erreur Sonarr"))
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/api/sonarr/series/{tmdb_id}")
+async def api_sonarr_check_series(tmdb_id: int):
+    """Vérifier si une série est déjà dans Sonarr."""
+    try:
+        from sonarr_service import search_series_in_sonarr
+        series = await search_series_in_sonarr(tmdb_id)
+        return {
+            "in_sonarr": series is not None,
+            "series": series,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/api/sonarr/series/by-id/{sonarr_id}/status")
+async def api_sonarr_series_status(sonarr_id: int):
+    """Obtenir le statut d'une série dans Sonarr (épisodes téléchargés, etc.)."""
+    try:
+        from sonarr_service import get_sonarr_series_status
+        status = await get_sonarr_series_status(sonarr_id)
+        if not status:
+            raise HTTPException(status_code=404, detail="Série introuvable dans Sonarr")
+        # Calculer progression: épisodes téléchargés / total
+        ep_file_count = status.get("episodeFileCount", 0)
+        total_episodes = status.get("totalEpisodeCount", 0) or 1
+        return {
+            "title": status.get("title"),
+            "episode_file_count": ep_file_count,
+            "total_episode_count": total_episodes,
+            "percent_complete": round(100 * ep_file_count / total_episodes) if total_episodes else 0,
+            "monitored": status.get("monitored", False),
+            "status": status.get("status", "unknown"),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @app.get("/api/supabase/status")
